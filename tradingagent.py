@@ -1,177 +1,184 @@
 import numpy as np
-import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 import random
-from collections import defaultdict
-import pickle
-import sys
-import os
+from collections import deque, namedtuple
 
-# Add numpy compatibility for pickle loading
-# This helps resolve the "ModuleNotFoundError: No module named 'numpy._core.numeric'" error
-if not hasattr(np, "_core"):
-    np._core = np.core
-if not hasattr(np._core, "numeric"):
-    np._core.numeric = np.core.numeric
+# Q-Network definition
+class QNetwork(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(QNetwork, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 1024)
+        self.fc2 = nn.Linear(1024, 516)
+        self.fc3 = nn.Linear(516, output_dim)
 
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+# Replay buffer for experience replay
+Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.memory = deque(maxlen=capacity)
+
+    def push(self, *args):
+        self.memory.append(Transition(*args))
+
+    def sample(self, batch_size):
+        transitions = random.sample(self.memory, batch_size)
+        return Transition(*zip(*transitions))
+
+    def __len__(self):
+        return len(self.memory)
 
 class TradingAgent:
-    def __init__(self):
-        # Initialize Q-table as a nested defaultdict
-        self.q_table = defaultdict(lambda: defaultdict(float))
-        self.alpha = 0.2  # Learning rate
-        self.gamma = 0.95  # Discount factor
-        self.epsilon = 0.3  # Exploration rate
-        self.epsilon_decay = 0.99  # Decay rate for exploration
-        self.min_epsilon = 0.05  # Minimum exploration rate
+    def __init__(self,
+                 state_size=7,
+                 action_size=31,
+                 lr=1e-3,
+                 gamma=0.99,
+                 batch_size=64,
+                 memory_size=10000,
+                 epsilon_start=0.5,
+                 epsilon_min=0.05,
+                 epsilon_decay=0.95,
+                 target_update_every=1000,
+                 train_episodes=30):
+        # Environment dimensions
+        self.state_size = state_size
+        self.action_size = action_size
+
+        # Hyperparameters
+        self.gamma = gamma
+        self.batch_size = batch_size
+        self.epsilon = epsilon_start
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
+        self.train_episodes = train_episodes
+        self.target_update_every = target_update_every
+
+        # Device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Networks
+        self.model = QNetwork(state_size, action_size).to(self.device)
+        self.target_model = QNetwork(state_size, action_size).to(self.device)
+        self.target_model.load_state_dict(self.model.state_dict())
+        self.target_model.eval()
+
+        # Optimizer
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+
+        # Replay buffer
+        self.memory = ReplayBuffer(memory_size)
 
     def reward_function(self, history):
-        # Sharpe-ratio inspired reward that penalizes volatility
-        returns = np.log(history["portfolio_valuation", -1] / history["portfolio_valuation", -2])
-        
-        # Add penalty for large position changes to discourage excessive trading
-        position_change = abs(history["position", -1] - history["position", -2])
-        trading_penalty = 0.01 * position_change
-        
-        return returns - trading_penalty
+        # Default reward: log return of portfolio valuation
+        return np.log(history["portfolio_valuation", -1] / history["portfolio_valuation", -2])
 
     def make_features(self, df):
-        # Price-based features
         df["feature_close"] = df["close"].pct_change()
-        df["feature_open"] = df["close"] / df["open"]
-        df["feature_high"] = df["high"] / df["close"]
-        df["feature_low"] = df["low"] / df["close"]
-        
-        # Volume features
-        df["feature_volume"] = df["volume"] / df["volume"].rolling(7 * 24).max()
-        
-        # Add moving averages
-        df["sma_5"] = df["close"].rolling(window=5).mean() / df["close"]
-        df["sma_20"] = df["close"].rolling(window=20).mean() / df["close"]
-        df["sma_ratio"] = df["sma_5"] / df["sma_20"]
-        
-        # Add Bollinger Bands (20-period, 2 standard deviations)
-        rolling_std = df["close"].rolling(window=20).std()
-        df["bb_upper"] = (df["close"].rolling(window=20).mean() + 2 * rolling_std) / df["close"]
-        df["bb_lower"] = (df["close"].rolling(window=20).mean() - 2 * rolling_std) / df["close"]
-        df["bb_width"] = (df["bb_upper"] * df["close"] - df["bb_lower"] * df["close"]) / df["close"]
-        
-        # Add RSI (14-period)
-        delta = df["close"].diff()
-        gain = delta.where(delta > 0, 0).rolling(window=14).mean()
-        loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
-        rs = gain / loss
-        df["rsi"] = 100 - (100 / (1 + rs))
-        df["rsi"] = df["rsi"] / 100  # Normalize to 0-1
-        
-        # Momentum
-        df["momentum_5"] = df["close"].pct_change(periods=5)
-        
+        df["feature_open"]  = df["close"] / df["open"]
+        df["feature_high"]  = df["high"]  / df["close"]
+        df["feature_low"]   = df["low"]   / df["close"]
+        df["feature_volume"] = df["volume"] / df["volume"].rolling(7*24).max()
         df.dropna(inplace=True)
         return df
 
     def get_position_list(self):
         return [x / 10.0 for x in range(-10, 21)]
 
-    def _discretize_state(self, observation):
-        """Convert continuous observation to discrete state for Q-table"""
-        features = []
-        
-        # Discretize each feature in observation
-        for i, value in enumerate(observation):
-            if i == 0:  # Position feature (already discrete)
-                features.append(int(value * 10))
-            else:
-                # Discretize other features into 10 bins
-                if value < -0.05:
-                    features.append(0)
-                elif value < -0.02:
-                    features.append(1)
-                elif value < -0.01:
-                    features.append(2)
-                elif value < 0:
-                    features.append(3)
-                elif value < 0.01:
-                    features.append(4)
-                elif value < 0.02:
-                    features.append(5)
-                elif value < 0.05:
-                    features.append(6)
-                elif value < 0.1:
-                    features.append(7)
-                elif value < 0.2:
-                    features.append(8)
-                else:
-                    features.append(9)
-        
-        # Return tuple for hashable state
-        return tuple(features)
-
-    def _choose_action(self, state, training=True):
-        """Choose action using epsilon-greedy policy"""
-        if training and random.random() < self.epsilon:
-            # Explore: choose random action
-            return random.randint(0, len(self.get_position_list()) - 1)
-        else:
-            # Exploit: choose best action from Q-table
-            state_actions = self.q_table[state]
-            if not state_actions:
-                # If state not in Q-table, choose random action
-                return random.randint(0, len(self.get_position_list()) - 1)
-            
-            # Find action with maximum Q-value
-            return max(state_actions.items(), key=lambda x: x[1])[0]
-
     def train(self, env):
-        num_episodes = 50  # Train over multiple episodes
-        
-        for episode in range(num_episodes):
+        total_steps = 0
+        for ep in range(self.train_episodes):
             try:
-                done, truncated = False, False
-                observation, info = env.reset()
-                
-                state = self._discretize_state(observation)
+                print(f"Training episode {ep+1}/{self.train_episodes}")
+                done = False
+                truncated = False
+                obs, info = env.reset()
+                state = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
                 total_reward = 0
-                
-                while not done and not truncated:
-                    # Choose action using epsilon-greedy
-                    action = self._choose_action(state, training=True)
-                    
-                    # Take action and observe next state and reward
-                    next_observation, reward, done, truncated, info = env.step(action)
-                    next_state = self._discretize_state(next_observation)
+                for i in range(5000):
+                    if done or truncated:
+                        break
+                    if i % 1000 == 0:
+                        print(f"Step {i} of episode {ep+1}")
+                    # Epsilon-greedy action selection
+                    if random.random() < self.epsilon:
+                        action = random.randrange(self.action_size)
+                    else:
+                        with torch.no_grad():
+                            q_values = self.model(state)
+                            action = q_values.argmax().item()
+
+                    next_obs, reward, done, truncated, info = env.step(action)
+                    next_state = torch.tensor(next_obs, dtype=torch.float32).unsqueeze(0).to(self.device)
                     total_reward += reward
-                    
-                    # Get maximum Q-value for next state
-                    next_max_q = max([self.q_table[next_state][a] for a in range(len(self.get_position_list()))], default=0)
-                    
-                    # Update Q-value using Q-learning update rule
-                    self.q_table[state][action] = (1 - self.alpha) * self.q_table[state][action] + \
-                                                self.alpha * (reward + self.gamma * next_max_q)
-                    
-                    # Move to next state
+                    # Store transition
+                    self.memory.push(state, action, reward, next_state, done)
                     state = next_state
-                
-                # Decay exploration rate
-                self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
-                
-                # Print progress
-                if (episode + 1) % 5 == 0:
-                    print(f"Episode {episode + 1}/{num_episodes}, Total reward: {total_reward:.2f}, Epsilon: {self.epsilon:.3f}")
+                    total_steps += 1
+
+                    # Learn
+                    if len(self.memory) >= self.batch_size:
+                        self._optimize()
+
+                    # Update target network
+                    if total_steps % self.target_update_every == 0:
+                        self.target_model.load_state_dict(self.model.state_dict())
+
+                # Decay epsilon
+                self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+                print(f"Episode {ep + 1}/{self.train_episodes}, Total reward: {total_reward:.2f}, Epsilon: {self.epsilon:.3f}")
+
             except Exception as e:
-                print(f"Error in episode {episode}: {str(e)}")
+                print(f"Error in episode {ep+1}: {str(e)}")
                 continue
 
+    def _optimize(self):
+        transitions = self.memory.sample(self.batch_size)
+        batch = Transition(*transitions)
+
+        state_batch = torch.cat(batch.state)
+        action_batch = torch.tensor(batch.action, device=self.device).unsqueeze(1)
+        reward_batch = torch.tensor(batch.reward, dtype=torch.float32, device=self.device).unsqueeze(1)
+        next_state_batch = torch.cat(batch.next_state)
+        done_mask = torch.tensor(batch.done, dtype=torch.bool, device=self.device)
+
+        # Current Q values
+        current_q = self.model(state_batch).gather(1, action_batch)
+
+        # Compute target Q values
+        next_q = torch.zeros(self.batch_size, 1, device=self.device)
+        with torch.no_grad():
+            next_q_vals = self.target_model(next_state_batch).max(1)[0].unsqueeze(1)
+        next_q[~done_mask] = next_q_vals[~done_mask]
+        expected_q = reward_batch + (self.gamma * next_q)
+
+        # Loss
+        loss = F.mse_loss(current_q, expected_q)
+
+        # Optimize
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
     def get_test_position(self, observation):
-        """Use learned policy for testing"""
-        state = self._discretize_state(observation)
-        action = self._choose_action(state, training=False)
-        return action
+        # Use the learned policy: choose action with highest Q-value
+        state = torch.tensor(observation, dtype=torch.float32).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            q_values = self.model(state)
+        return q_values.argmax().item()
 
     def test(self, env, n_epochs):
-        # DO NOT CHANGE - all changes will be ignored after upload to BRUTE!
         for _ in range(n_epochs):
-            done, truncated = False, False
+            done = False
+            truncated = False
             observation, info = env.reset()
             while not done and not truncated:
-                new_position = self.get_test_position(observation)
-                observation, reward, done, truncated, info = env.step(new_position)
+                action = self.get_test_position(observation)
+                observation, reward, done, truncated, info = env.step(action)
